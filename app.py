@@ -27,7 +27,6 @@ def login(user_id, password):
         session.get("https://www.dcinside.com/", timeout=10)
     except Exception as e:
         return None, f"사이트 접속 실패: {e}"
-
     try:
         session.post(
             "https://www.dcinside.com/member_login",
@@ -41,22 +40,24 @@ def login(user_id, password):
     cookies = {c.name for c in session.cookies}
     if "user_id" in cookies or "dc_auth_verify" in cookies or "PHPSESSID" in cookies:
         return session, None
-
     try:
         r = session.get(f"https://gallog.dcinside.com/{user_id}/", timeout=10)
         if "로그아웃" in r.text or user_id in r.text:
             return session, None
     except Exception:
         pass
-
     return None, "아이디 또는 비밀번호를 확인하세요."
 
 
-def collect_all_posts(session, user_id, progress_callback=None):
-    all_posts = []
+def collect_items(session, user_id, item_type, progress_callback=None):
+    """
+    item_type: 'posting' (글) | 'comment' (댓글)
+    반환: [(gall_id, no), ...]
+    """
+    all_items = []
     page = 1
     while True:
-        url = f"https://gallog.dcinside.com/{user_id}/posting?p={page}"
+        url = f"https://gallog.dcinside.com/{user_id}/{item_type}?p={page}"
         try:
             r = session.get(url, timeout=10)
         except Exception as e:
@@ -65,20 +66,20 @@ def collect_all_posts(session, user_id, progress_callback=None):
             break
 
         soup = BeautifulSoup(r.text, "html.parser")
-        posts = []
+        items = []
         for a in soup.select("a[href*='board/view']"):
             href = a.get("href", "")
             gall_id = re.search(r"[?&]id=([^&]+)", href)
             no = re.search(r"[?&]no=(\d+)", href)
             if gall_id and no:
-                posts.append((gall_id.group(1), no.group(1)))
+                items.append((gall_id.group(1), no.group(1)))
 
-        if not posts:
+        if not items:
             break
 
-        all_posts.extend(posts)
+        all_items.extend(items)
         if progress_callback:
-            progress_callback(f"페이지 {page} 수집 완료 — 누적 {len(all_posts)}개")
+            progress_callback(f"페이지 {page} 수집 완료 — 누적 {len(all_items)}개")
 
         page_nums = [
             int(a.text.strip())
@@ -89,15 +90,18 @@ def collect_all_posts(session, user_id, progress_callback=None):
             break
         page += 1
 
-    return all_posts
+    return all_items
 
 
-def delete_post(session, user_id, gall_id, post_no):
+def delete_item(session, user_id, gall_id, no, log_type):
+    """
+    log_type: 'post' (글) | 'comment' (댓글)
+    """
     url = f"https://gallog.dcinside.com/{user_id}/ajax/log_list_ajax/delete"
     try:
         r = session.post(
             url,
-            data={"id": gall_id, "no": post_no, "log_type": "post"},
+            data={"id": gall_id, "no": no, "log_type": log_type},
             headers={
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": f"https://gallog.dcinside.com/{user_id}/posting",
@@ -119,7 +123,7 @@ def delete_post(session, user_id, gall_id, post_no):
         return False, str(e)
 
 
-def run_deletion(user_id, password, progress_callback=None, delay=0.8):
+def run_deletion(user_id, password, delete_posts, delete_comments, progress_callback=None, delay=0.8):
     if progress_callback:
         progress_callback("로그인 중...")
     session, err = login(user_id, password)
@@ -127,27 +131,49 @@ def run_deletion(user_id, password, progress_callback=None, delay=0.8):
         return 0, 0, err
 
     if progress_callback:
-        progress_callback("✓ 로그인 성공. 글 목록 수집 중...")
-    posts = collect_all_posts(session, user_id, progress_callback)
+        progress_callback("✓ 로그인 성공.")
 
-    if not posts:
-        return 0, 0, "삭제할 글이 없거나 글 목록을 불러올 수 없습니다."
+    total_success, total_fail = 0, 0
 
-    if progress_callback:
-        progress_callback(f"총 {len(posts)}개 글 발견. 삭제 시작...")
-
-    success, fail = 0, 0
-    for i, (gall_id, post_no) in enumerate(posts, 1):
-        ok, msg = delete_post(session, user_id, gall_id, post_no)
-        if ok:
-            success += 1
-        else:
-            fail += 1
+    # 글 삭제
+    if delete_posts:
         if progress_callback:
-            progress_callback(f"[{i}/{len(posts)}] {'✓' if ok else '✗'} {gall_id}/{post_no} — {msg}")
-        time.sleep(delay)
+            progress_callback("글 목록 수집 중...")
+        posts = collect_items(session, user_id, "posting", progress_callback)
+        if posts:
+            if progress_callback:
+                progress_callback(f"글 {len(posts)}개 발견. 삭제 시작...")
+            for i, (gall_id, no) in enumerate(posts, 1):
+                ok, msg = delete_item(session, user_id, gall_id, no, "post")
+                total_success += ok
+                total_fail += not ok
+                if progress_callback:
+                    progress_callback(f"[글 {i}/{len(posts)}] {'✓' if ok else '✗'} {gall_id}/{no} — {msg}")
+                time.sleep(delay)
+        else:
+            if progress_callback:
+                progress_callback("삭제할 글 없음.")
 
-    return success, fail, None
+    # 댓글 삭제
+    if delete_comments:
+        if progress_callback:
+            progress_callback("댓글 목록 수집 중...")
+        comments = collect_items(session, user_id, "comment", progress_callback)
+        if comments:
+            if progress_callback:
+                progress_callback(f"댓글 {len(comments)}개 발견. 삭제 시작...")
+            for i, (gall_id, no) in enumerate(comments, 1):
+                ok, msg = delete_item(session, user_id, gall_id, no, "comment")
+                total_success += ok
+                total_fail += not ok
+                if progress_callback:
+                    progress_callback(f"[댓글 {i}/{len(comments)}] {'✓' if ok else '✗'} {gall_id}/{no} — {msg}")
+                time.sleep(delay)
+        else:
+            if progress_callback:
+                progress_callback("삭제할 댓글 없음.")
+
+    return total_success, total_fail, None
 
 
 # ── Streamlit UI ──────────────────────────────────────────────
@@ -171,13 +197,13 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', sans-serif; }
 st.markdown("""
 <div class="title-block">
   <h1>🗑️ dci-cleaner</h1>
-  <p>디시인사이드 내 글 전체 삭제 — 일반 갤러리 · 마이너 갤러리 지원</p>
+  <p>디시인사이드 글 · 댓글 전체 삭제 — 일반 갤러리 · 마이너 갤러리 지원</p>
 </div>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="warn-box">
-  ⚠️ <b>삭제된 글은 복구되지 않습니다.</b><br>
+  ⚠️ <b>삭제된 글·댓글은 복구되지 않습니다.</b><br>
   비밀번호는 디시 서버로만 전달되며 저장되지 않습니다.
 </div>
 """, unsafe_allow_html=True)
@@ -192,11 +218,17 @@ with col1:
 with col2:
     password = st.text_input("비밀번호", type="password", placeholder="••••••••", disabled=st.session_state.running)
 
+col3, col4 = st.columns(2)
+with col3:
+    delete_posts = st.checkbox("글 삭제", value=True, disabled=st.session_state.running)
+with col4:
+    delete_comments = st.checkbox("댓글 삭제", value=True, disabled=st.session_state.running)
+
 delay = st.slider("요청 딜레이 (초)", 0.5, 3.0, 0.8, 0.1, disabled=st.session_state.running)
 
 start_btn = st.button(
-    "🗑️ 전체 삭제 시작",
-    disabled=st.session_state.running or not user_id or not password,
+    "🗑️ 삭제 시작",
+    disabled=st.session_state.running or not user_id or not password or (not delete_posts and not delete_comments),
     use_container_width=True,
     type="primary",
 )
@@ -210,11 +242,11 @@ def render_logs():
     log_placeholder.markdown(f'<div class="log-box">{log_text}</div>', unsafe_allow_html=True)
 
 
-def run_in_thread(uid, pw, q, d):
+def run_in_thread(uid, pw, dp, dc, q, d):
     def cb(msg):
         q.put(("log", msg))
     try:
-        result = run_deletion(uid, pw, progress_callback=cb, delay=d)
+        result = run_deletion(uid, pw, dp, dc, progress_callback=cb, delay=d)
         q.put(("done", result))
     except Exception as e:
         q.put(("done", (0, 0, str(e))))
@@ -226,7 +258,11 @@ if start_btn and not st.session_state.running:
     st.session_state.result = None
 
     q = queue.Queue()
-    threading.Thread(target=run_in_thread, args=(user_id, password, q, delay), daemon=True).start()
+    threading.Thread(
+        target=run_in_thread,
+        args=(user_id, password, delete_posts, delete_comments, q, delay),
+        daemon=True,
+    ).start()
 
     while True:
         try:
